@@ -159,6 +159,7 @@ def process_downloaded_cbz(filepath: str) -> str:
     modified = False
 
     try:
+        # 尝试打开 ZIP 文件，如果文件损坏这里会直接报错
         with zipfile.ZipFile(current_filepath, 'r') as zin, zipfile.ZipFile(temp_path, 'w',
                                                                             zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
@@ -187,7 +188,12 @@ def process_downloaded_cbz(filepath: str) -> str:
             shutil.move(temp_path, current_filepath)
         else:
             os.remove(temp_path)
-    except Exception:
+
+        # ✨ 核心修复 1：修改文件权限为 666，确保 Kavita 能读写！
+        os.chmod(current_filepath, 0o666)
+
+    except Exception as e:
+        print(f"[Error] 严重错误！压缩包处理失败 (可能损坏): {e}")
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
@@ -263,51 +269,49 @@ async def cache_gallery(interaction: discord.Interaction, query: str):
     if not target_id:
         return await interaction.followup.send("❌ 找不到对应的本子。")
 
-    # ✨ XML ID 瞬间查重拦截
     if target_id in bot.local_index:
         return await interaction.followup.send(
             f"✅ 该本子已经在库中，无需重复下载！\n📂 已存文件：`{bot.local_index[target_id]}`")
 
-    # ================= 1. 主动获取最美标题 =================
     try:
         async with bot.session.get(f"{API_BASE}/galleries/{target_id}", headers=HEADERS) as gal_resp:
             if gal_resp.status != 200:
                 return await interaction.followup.send(f"❌ 无法获取本子详情，状态码: {gal_resp.status}")
             gal_data = await gal_resp.json()
 
-            # 依次尝试获取 pretty > english > 兜底
             raw_title = gal_data.get('title', {}).get('pretty') or gal_data.get('title', {}).get(
                 'english') or f"Gallery_{target_id}"
-
-            # 剔除 Windows/Linux 不允许的文件名特殊符号 (\ / : * ? " < > |)
             safe_title = re.sub(r'[\\/*?:"<>|]', "", raw_title).strip()
-
             final_filename = f"{safe_title}.cbz"
             final_filepath = os.path.join(SAVE_DIRECTORY, final_filename)
 
     except Exception as e:
         return await interaction.followup.send(f"❌ 获取本子信息失败: {str(e)}")
 
-    # ================= 2. 开始流式下载 =================
     download_url = f"{API_BASE}/galleries/{target_id}/download"
     try:
         async with bot.session.post(download_url, headers=HEADERS) as resp:
             if resp.status != 200:
                 return await interaction.followup.send(f"❌ 下载失败，API 状态码: {resp.status}")
 
-            # 不看官方眼色了，直接存为我们自己取的完美标题
+            # ✨ 核心修复 2：检查返回的是不是 ZIP 文件！防范假压缩包。
+            content_type = resp.headers.get('Content-Type', '')
+            if 'application/json' in content_type:
+                error_msg = await resp.text()
+                return await interaction.followup.send(f"❌ API 拒绝了下载请求 (返回了 JSON): {error_msg}")
+
             with open(final_filepath, 'wb') as f:
                 async for chunk in resp.content.iter_chunked(1024 * 1024):
                     f.write(chunk)
 
-        # 后台修复 Kavita 元数据 (AlternateSeries)
+            # 同样赋予初步权限，防止后台线程报错
+            os.chmod(final_filepath, 0o666)
+
         final_filepath_after_process = await asyncio.to_thread(process_downloaded_cbz, final_filepath)
         result_filename = os.path.basename(final_filepath_after_process)
 
-        # ✨ 存入索引
         bot.local_index[target_id] = result_filename
         await asyncio.to_thread(bot.save_index_to_disk)
-        print(f"[Index] ➕ 成功存入 XML ID 索引: {target_id} -> {result_filename}")
 
         await interaction.followup.send(
             f"✅ 下载并修复成功！\n📂 存档: `{result_filename}`\n👉 可以去 Kavita 里面强制扫描了。")
