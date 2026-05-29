@@ -262,28 +262,58 @@ async def read_gallery(interaction: discord.Interaction, query: str, public: boo
     if not target_id:
         return await interaction.followup.send("❌ 找不到本子。")
 
-    # 1. 本地查重拦截
-    local_filepath = None
-    download_url = f"{API_BASE}/galleries/{target_id}/download"
-    try:
-        async with bot.session.post(download_url, headers=HEADERS) as resp:
-            if resp.status == 200:
-                cd_header = resp.headers.get('Content-Disposition')
-                if cd_header:
-                    msg = email.message.EmailMessage()
-                    msg['content-disposition'] = cd_header
-                    original_filename = msg.get_filename() or ""
-                    if original_filename.endswith(".zip"):
-                        original_filename = original_filename[:-4] + ".cbz"
-                    final_filename = original_filename
-                    if PREFIX_PATTERN.search(final_filename):
-                        final_filename = PREFIX_PATTERN.sub("", final_filename)
+        # ================= 1. 尝试寻找本地缓存文件 (带模糊匹配增强版) =================
+        local_filepath = None
+        download_url = f"{API_BASE}/galleries/{target_id}/download"
 
-                    possible_path = os.path.join(SAVE_DIRECTORY, final_filename)
-                    if os.path.exists(possible_path):
-                        local_filepath = possible_path
-    except:
-        pass
+        try:
+            async with bot.session.post(download_url, headers=HEADERS) as resp:
+                if resp.status == 200:
+                    cd_header = resp.headers.get('Content-Disposition')
+                    if cd_header:
+                        msg = email.message.EmailMessage()
+                        msg['content-disposition'] = cd_header
+                        original_filename = msg.get_filename() or ""
+
+                        if original_filename.endswith(".zip"):
+                            original_filename = original_filename[:-4] + ".cbz"
+
+                        final_filename = original_filename
+                        if PREFIX_PATTERN.search(final_filename):
+                            final_filename = PREFIX_PATTERN.sub("", final_filename)
+
+                        possible_path = os.path.join(SAVE_DIRECTORY, final_filename)
+
+                        print(f"\n[Debug] === 开始本地查重 ID: {target_id} ===")
+                        print(f"[Debug] 我预测的文件名是: {final_filename}")
+
+                        # 严谨模式：精确匹配
+                        if os.path.exists(possible_path):
+                            print("[Debug] ✅ 严谨匹配成功！直接读取。")
+                            local_filepath = possible_path
+                        else:
+                            print("[Debug] ❌ 严谨匹配失败，开启模糊匹配模式...")
+
+                            # 模糊模式：剔除所有空格和标点符号，只比对字母、数字和中日文字符
+                            def clean_str(s):
+                                return re.sub(r'\W+', '', s).lower()
+
+                            target_clean = clean_str(final_filename)
+
+                            # 扫描目录下的所有文件
+                            if os.path.exists(SAVE_DIRECTORY):
+                                existing_files = os.listdir(SAVE_DIRECTORY)
+                                print(f"[Debug] 当前挂载目录中共发现 {len(existing_files)} 个文件。")
+
+                                for existing_file in existing_files:
+                                    if clean_str(existing_file) == target_clean:
+                                        print(f"[Debug] ✅ 模糊匹配成功！硬盘里的真实名字是: {existing_file}")
+                                        local_filepath = os.path.join(SAVE_DIRECTORY, existing_file)
+                                        break
+                            else:
+                                print(f"[Error] 严重错误：找不到映射的文件夹 {SAVE_DIRECTORY}")
+        except Exception as e:
+            print(f"[Error] 本地查重检测发生异常: {e}")
 
     # 2. 本地模式加载
     if local_filepath:
