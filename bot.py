@@ -254,7 +254,7 @@ class GalleryReaderView(discord.ui.View):
 
 
 # ================= 7. 核心指令 =================
-@bot.tree.command(name="cache", description="下载本子、自动去前缀、修复 Kavita 元数据")
+@bot.tree.command(name="cache", description="下载本子、自动命名、修复 Kavita 元数据")
 @app_commands.describe(query="6位ID或搜索词")
 async def cache_gallery(interaction: discord.Interaction, query: str):
     await interaction.response.defer(thinking=True)
@@ -263,42 +263,48 @@ async def cache_gallery(interaction: discord.Interaction, query: str):
     if not target_id:
         return await interaction.followup.send("❌ 找不到对应的本子。")
 
-    # ✨ XML ID 瞬间查重拦截！连 API 都不要调用了！
+    # ✨ XML ID 瞬间查重拦截
     if target_id in bot.local_index:
         return await interaction.followup.send(
             f"✅ 该本子已经在库中，无需重复下载！\n📂 已存文件：`{bot.local_index[target_id]}`")
 
-    download_url = f"{API_BASE}/galleries/{target_id}/download"
+    # ================= 1. 主动获取最美标题 =================
+    try:
+        async with bot.session.get(f"{API_BASE}/galleries/{target_id}", headers=HEADERS) as gal_resp:
+            if gal_resp.status != 200:
+                return await interaction.followup.send(f"❌ 无法获取本子详情，状态码: {gal_resp.status}")
+            gal_data = await gal_resp.json()
 
+            # 依次尝试获取 pretty > english > 兜底
+            raw_title = gal_data.get('title', {}).get('pretty') or gal_data.get('title', {}).get(
+                'english') or f"Gallery_{target_id}"
+
+            # 剔除 Windows/Linux 不允许的文件名特殊符号 (\ / : * ? " < > |)
+            safe_title = re.sub(r'[\\/*?:"<>|]', "", raw_title).strip()
+
+            final_filename = f"{safe_title}.cbz"
+            final_filepath = os.path.join(SAVE_DIRECTORY, final_filename)
+
+    except Exception as e:
+        return await interaction.followup.send(f"❌ 获取本子信息失败: {str(e)}")
+
+    # ================= 2. 开始流式下载 =================
+    download_url = f"{API_BASE}/galleries/{target_id}/download"
     try:
         async with bot.session.post(download_url, headers=HEADERS) as resp:
             if resp.status != 200:
                 return await interaction.followup.send(f"❌ 下载失败，API 状态码: {resp.status}")
 
-            cd_header = resp.headers.get('Content-Disposition')
-            if cd_header:
-                msg = email.message.EmailMessage()
-                msg['content-disposition'] = cd_header
-                original_filename = msg.get_filename() or f"nhentai-{target_id} - unknown.zip"
-            else:
-                original_filename = f"nhentai-{target_id} - unknown.zip"
-
-            if original_filename.endswith(".zip"):
-                original_filename = original_filename[:-4] + ".cbz"
-
-            final_filename = original_filename
-            if PREFIX_PATTERN.search(final_filename):
-                final_filename = PREFIX_PATTERN.sub("", final_filename)
-
-            final_filepath = os.path.join(SAVE_DIRECTORY, final_filename)
+            # 不看官方眼色了，直接存为我们自己取的完美标题
             with open(final_filepath, 'wb') as f:
                 async for chunk in resp.content.iter_chunked(1024 * 1024):
                     f.write(chunk)
 
+        # 后台修复 Kavita 元数据 (AlternateSeries)
         final_filepath_after_process = await asyncio.to_thread(process_downloaded_cbz, final_filepath)
         result_filename = os.path.basename(final_filepath_after_process)
 
-        # ✨ 下载完成后：使用 6位数ID 直接存入索引
+        # ✨ 存入索引
         bot.local_index[target_id] = result_filename
         await asyncio.to_thread(bot.save_index_to_disk)
         print(f"[Index] ➕ 成功存入 XML ID 索引: {target_id} -> {result_filename}")
@@ -308,7 +314,6 @@ async def cache_gallery(interaction: discord.Interaction, query: str):
 
     except Exception as e:
         await interaction.followup.send(f"❌ 发生错误: {str(e)}")
-
 
 @bot.tree.command(name="read", description="在 Discord 阅读本子 (基于 XML ID 极速秒开)")
 @app_commands.describe(query="6位数ID或搜索词", public="公开显示(带马赛克) 还是 仅自己可见(无码)")
