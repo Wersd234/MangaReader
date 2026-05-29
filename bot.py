@@ -71,7 +71,11 @@ def get_id_from_cbz(filepath: str) -> str:
 
 def generate_comicinfo_xml(gal_data, gal_id: str) -> str:
     """根据 API 返回的数据，自动生成完美的 ComicInfo.xml"""
-    title = gal_data.get('title', {}).get('pretty') or gal_data.get('title', {}).get('english') or f"Gallery_{gal_id}"
+
+    # ✨ 核心修复：优先使用 english，它包含了完整的汉化组中文字符
+    title_dict = gal_data.get('title', {})
+    title = title_dict.get('english') or title_dict.get('japanese') or title_dict.get('pretty') or f"Gallery_{gal_id}"
+
 
     # 解析标签、作者、语言
     artists = []
@@ -349,8 +353,11 @@ async def cache_gallery(interaction: discord.Interaction, query: str):
                 return await interaction.followup.send(f"❌ 无法获取本子详情，状态码: {gal_resp.status}")
             gal_data = await gal_resp.json()
 
-            raw_title = gal_data.get('title', {}).get('pretty') or gal_data.get('title', {}).get(
-                'english') or f"Gallery_{target_id}"
+            # ✨ 核心修复：文件名也同样优先使用 english 全称
+            title_dict = gal_data.get('title', {})
+            raw_title = title_dict.get('english') or title_dict.get('japanese') or title_dict.get(
+                'pretty') or f"Gallery_{target_id}"
+
             safe_title = re.sub(r'[\\/*?:"<>|]', "", raw_title).strip()
             final_filename = f"{safe_title}.cbz"
             final_filepath = os.path.join(SAVE_DIRECTORY, final_filename)
