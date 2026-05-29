@@ -7,10 +7,10 @@ services:
     restart: unless-stopped
     
     environment:
-      # 对齐你所在的澳洲悉尼时区
       - TZ=Australia/Sydney
-      # (不用写 TOKEN，Portainer 网页上填的会自动注入)
-      
+      # 极简穿透语法：不写等号，直接让 Docker 去抓取 Portainer 网页上填的值
+      - DISCORD_TOKEN
+      - NHENTAI_API_KEY
+
     volumes:
-      # 将服务器上的 Nextcloud 真实文件夹，映射给容器里的 local_downloads
       - /home/serveradmin/Disks/NC/NC_Files/nextcloud_data/Epub/files/本子/nhentai:/app/local_downloads
