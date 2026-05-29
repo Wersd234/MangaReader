@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  nhentai-bot:
+    build: .
+    container_name: nhentai-bot
+    restart: unless-stopped
+    
+    environment:
+      # 对齐你所在的澳洲悉尼时区
+      - TZ=Australia/Sydney
+      # (不用写 TOKEN，Portainer 网页上填的会自动注入)
+      
+    volumes:
+      # 将服务器上的 Nextcloud 真实文件夹，映射给容器里的 local_downloads
+      - /home/serveradmin/Disks/NC/NC_Files/nextcloud_data/Epub/files/本子/nhentai:/app/local_downloads
