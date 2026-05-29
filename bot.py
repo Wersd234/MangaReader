@@ -269,10 +269,12 @@ async def cache_gallery(interaction: discord.Interaction, query: str):
     if not target_id:
         return await interaction.followup.send("❌ 找不到对应的本子。")
 
+    # ✨ XML ID 瞬间查重拦截
     if target_id in bot.local_index:
         return await interaction.followup.send(
             f"✅ 该本子已经在库中，无需重复下载！\n📂 已存文件：`{bot.local_index[target_id]}`")
 
+    # ================= 1. 主动获取最美标题 =================
     try:
         async with bot.session.get(f"{API_BASE}/galleries/{target_id}", headers=HEADERS) as gal_resp:
             if gal_resp.status != 200:
@@ -288,30 +290,40 @@ async def cache_gallery(interaction: discord.Interaction, query: str):
     except Exception as e:
         return await interaction.followup.send(f"❌ 获取本子信息失败: {str(e)}")
 
-    download_url = f"{API_BASE}/galleries/{target_id}/download"
+    # ================= 2. 获取专属下载直链 =================
+    download_api_url = f"{API_BASE}/galleries/{target_id}/download"
     try:
-        async with bot.session.post(download_url, headers=HEADERS) as resp:
+        async with bot.session.post(download_api_url, headers=HEADERS) as resp:
             if resp.status != 200:
-                return await interaction.followup.send(f"❌ 下载失败，API 状态码: {resp.status}")
+                return await interaction.followup.send(f"❌ 获取下载链接失败，API 状态码: {resp.status}")
 
-            # ✨ 核心修复 2：检查返回的是不是 ZIP 文件！防范假压缩包。
-            content_type = resp.headers.get('Content-Type', '')
-            if 'application/json' in content_type:
-                error_msg = await resp.text()
-                return await interaction.followup.send(f"❌ API 拒绝了下载请求 (返回了 JSON): {error_msg}")
+            resp_json = await resp.json()
+            actual_download_url = resp_json.get("url")
+
+            if not actual_download_url:
+                return await interaction.followup.send("❌ API 未返回真实的下载链接！")
+
+        # ================= 3. 开始流式下载真实的 ZIP 文件 =================
+        # 注意：这里向图片 CDN 请求真实文件，必须用无 API Key 的伪装头 (CDN_HEADERS)
+        async with bot.session.get(actual_download_url, headers=CDN_HEADERS) as resp:
+            if resp.status != 200:
+                return await interaction.followup.send(f"❌ 下载压缩包失败，CDN 状态码: {resp.status}")
 
             with open(final_filepath, 'wb') as f:
                 async for chunk in resp.content.iter_chunked(1024 * 1024):
                     f.write(chunk)
 
-            # 同样赋予初步权限，防止后台线程报错
+            # ✨ 修改文件权限，确保 Kavita (非 root 用户) 能够顺利读取
             os.chmod(final_filepath, 0o666)
 
+        # ================= 4. 后台修复 Kavita 元数据 =================
         final_filepath_after_process = await asyncio.to_thread(process_downloaded_cbz, final_filepath)
         result_filename = os.path.basename(final_filepath_after_process)
 
+        # 存入索引
         bot.local_index[target_id] = result_filename
         await asyncio.to_thread(bot.save_index_to_disk)
+        print(f"[Index] ➕ 成功存入 XML ID 索引: {target_id} -> {result_filename}")
 
         await interaction.followup.send(
             f"✅ 下载并修复成功！\n📂 存档: `{result_filename}`\n👉 可以去 Kavita 里面强制扫描了。")
