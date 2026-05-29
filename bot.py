@@ -69,6 +69,54 @@ def get_id_from_cbz(filepath: str) -> str:
     return None
 
 
+def generate_comicinfo_xml(gal_data, gal_id: str) -> str:
+    """根据 API 返回的数据，自动生成完美的 ComicInfo.xml"""
+    title = gal_data.get('title', {}).get('pretty') or gal_data.get('title', {}).get('english') or f"Gallery_{gal_id}"
+
+    # 解析标签、作者、语言
+    artists = []
+    tags = []
+    language = "ja"  # 默认日语
+
+    for t in gal_data.get('tags', []):
+        t_type = t.get('type')
+        t_name = t.get('name')
+        if t_type == 'artist' or t_type == 'group':
+            artists.append(t_name)
+        elif t_type == 'tag':
+            tags.append(t_name)
+        elif t_type == 'language':
+            if t_name == 'chinese':
+                language = 'zh'
+            elif t_name == 'english':
+                language = 'en'
+
+    writer = ", ".join(artists) if artists else "Unknown"
+    tags_str = ", ".join(tags)
+    page_count = gal_data.get('num_pages', 0)
+
+    # 拼装为标准的 Kavita XML 格式
+    xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Title>{title}</Title>
+  <Series>{title}</Series>
+  <Writer>{writer}</Writer>
+  <Tags>{tags_str}</Tags>
+  <LanguageISO>{language}</LanguageISO>
+  <Web>https://nhentai.net/g/{gal_id}/</Web>
+  <PageCount>{page_count}</PageCount>
+  <Manga>YesAndRightToLeft</Manga>
+  <AgeRating>Adults Only 18+</AgeRating>
+</ComicInfo>"""
+    return xml
+
+
+def inject_comicinfo_to_cbz(filepath: str, xml_str: str):
+    """将生成的 XML 注入到下载好的 CBZ 压缩包中"""
+    # 以追加模式 'a' 打开 zip，直接将 XML 塞入内部
+    with zipfile.ZipFile(filepath, 'a', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr('ComicInfo.xml', xml_str.encode('utf-8'))
+
 # ================= 4. 核心 Bot 类 (精准 ID 索引) =================
 class NhentaiBot(commands.Bot):
     def __init__(self):
@@ -136,6 +184,7 @@ class NhentaiBot(commands.Bot):
 
 
 bot = NhentaiBot()
+
 
 
 # ================= 5. Kavita 刮削逻辑 =================
@@ -277,10 +326,12 @@ class GalleryReaderView(discord.ui.View):
 
 
 # ================= 7. 核心指令 =================
-@bot.tree.command(name="cache", description="下载本子、使用官方名去前缀、修复 Kavita 元数据")
+# ================= 7. 核心指令 =================
+@bot.tree.command(name="cache", description="下载本子、自动命名并注入完美 Kavita 刮削数据")
 @app_commands.describe(query="6位ID或搜索词")
 async def cache_gallery(interaction: discord.Interaction, query: str):
-    await interaction.response.defer(thinking=True)
+    # 开启仅自己可见 (隐私保护)
+    await interaction.response.defer(thinking=True, ephemeral=True)
 
     target_id = await resolve_query_to_id(query)
     if not target_id:
@@ -291,9 +342,21 @@ async def cache_gallery(interaction: discord.Interaction, query: str):
         return await interaction.followup.send(
             f"✅ 该本子已经在库中，无需重复下载！\n📂 已存文件：`{bot.local_index[target_id]}`")
 
-    # ================= 1. 获取专属下载直链 =================
-    download_api_url = f"{API_BASE}/galleries/{target_id}/download"
     try:
+        # ================= 1. 获取本子详情，生成完美标题 =================
+        async with bot.session.get(f"{API_BASE}/galleries/{target_id}", headers=HEADERS) as gal_resp:
+            if gal_resp.status != 200:
+                return await interaction.followup.send(f"❌ 无法获取本子详情，状态码: {gal_resp.status}")
+            gal_data = await gal_resp.json()
+
+            raw_title = gal_data.get('title', {}).get('pretty') or gal_data.get('title', {}).get(
+                'english') or f"Gallery_{target_id}"
+            safe_title = re.sub(r'[\\/*?:"<>|]', "", raw_title).strip()
+            final_filename = f"{safe_title}.cbz"
+            final_filepath = os.path.join(SAVE_DIRECTORY, final_filename)
+
+        # ================= 2. 获取专属下载直链 =================
+        download_api_url = f"{API_BASE}/galleries/{target_id}/download"
         async with bot.session.post(download_api_url, headers=HEADERS) as resp:
             if resp.status != 200:
                 return await interaction.followup.send(f"❌ 获取下载链接失败，API 状态码: {resp.status}")
@@ -303,53 +366,40 @@ async def cache_gallery(interaction: discord.Interaction, query: str):
             if not actual_download_url:
                 return await interaction.followup.send("❌ API 未返回真实的下载链接！")
 
-        # ================= 2. 访问直链，获取官方原名并下载 =================
+        # ================= 3. 开始流式下载真实的 ZIP 文件 =================
         async with bot.session.get(actual_download_url, headers=CDN_HEADERS) as resp:
             if resp.status != 200:
                 return await interaction.followup.send(f"❌ 下载压缩包失败，CDN 状态码: {resp.status}")
 
-            # 防假压缩包拦截
             content_type = resp.headers.get('Content-Type', '').lower()
             if 'html' in content_type or 'text' in content_type:
                 fake_html = await resp.text()
-                return await interaction.followup.send(
-                    f"❌ 下载被拦截！拿到的是网页而不是压缩包。\n前100字符: `{fake_html[:100]}`")
+                return await interaction.followup.send(f"❌ 下载被拦截！拿到的是网页。\n前100字符: `{fake_html[:100]}`")
 
-            # ✨ 核心修复：在这里获取 Content-Disposition，这才是带有真名的地方！
-            cd_header = resp.headers.get('Content-Disposition')
-            if cd_header:
-                msg = email.message.EmailMessage()
-                msg['content-disposition'] = cd_header
-                original_filename = msg.get_filename() or f"nhentai-{target_id} - unknown.zip"
-            else:
-                original_filename = f"nhentai-{target_id} - unknown.zip"
-
-            # 改为 cbz 后缀
-            if original_filename.endswith(".zip"):
-                original_filename = original_filename[:-4] + ".cbz"
-
-            final_filepath = os.path.join(SAVE_DIRECTORY, original_filename)
-
-            # 流式写入硬盘
+            # 写入硬盘
             with open(final_filepath, 'wb') as f:
                 async for chunk in resp.content.iter_chunked(1024 * 1024):
                     f.write(chunk)
 
-            os.chmod(final_filepath, 0o666)
+        # ================= 4. 自己生成并注入最完美的 ComicInfo.xml =================
+        xml_content = generate_comicinfo_xml(gal_data, target_id)
+        await asyncio.to_thread(inject_comicinfo_to_cbz, final_filepath, xml_content)
 
-        # ================= 3. 交给你的原汁原味后台逻辑处理 =================
-        final_filepath_after_process = await asyncio.to_thread(process_downloaded_cbz, final_filepath)
-        result_filename = os.path.basename(final_filepath_after_process)
+        # 赋予权限给 Kavita (0o666 代表可读可写)
+        os.chmod(final_filepath, 0o666)
 
-        # 存入 XML ID 索引
+        # ================= 5. 存入后台索引 =================
+        result_filename = os.path.basename(final_filepath)
         bot.local_index[target_id] = result_filename
         await asyncio.to_thread(bot.save_index_to_disk)
+        print(f"[Index] ➕ 成功注入 XML 并存入索引: {target_id} -> {result_filename}")
 
         await interaction.followup.send(
-            f"✅ 下载并修复成功！\n📂 存档: `{result_filename}`\n👉 可以去 Kavita 里面强制扫描了。")
+            f"✅ 下载并注入刮削数据成功！\n📂 存档: `{result_filename}`\n👉 等待几分钟去 NC 或者在 Kavita 里强制扫描即可。")
 
     except Exception as e:
-        await interaction.followup.send(f"❌ 发生错误: {str(e)}")
+        # 兜住所有上面可能发生的报错
+        await interaction.followup.send(f"❌ 发生致命错误: {str(e)}")
 
 @bot.tree.command(name="read", description="在 Discord 阅读本子 (基于 XML ID 极速秒开)")
 @app_commands.describe(query="6位数ID或搜索词", public="公开显示(带马赛克) 还是 仅自己可见(无码)")
