@@ -24,14 +24,13 @@ if not DISCORD_TOKEN or not NHENTAI_API_KEY:
 
 # ================= 2. 路径与网络配置 =================
 SAVE_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_downloads")
-# 索引文件的持久化路径，存在本子目录下
 INDEX_FILE = os.path.join(SAVE_DIRECTORY, "_bot_index.json")
 
 API_BASE = "https://nhentai.net/api/v2"
 
 HEADERS = {
     "Authorization": f"Key {NHENTAI_API_KEY}",
-    "User-Agent": "MyPrivateDiscordBot/4.0 (Persistent Index)"
+    "User-Agent": "MyPrivateDiscordBot/5.0 (XML ID Indexing)"
 }
 
 CDN_HEADERS = {
@@ -43,11 +42,6 @@ PREFIX_PATTERN = re.compile(r"^nhentai-\d+\s*-\s*")
 
 
 # ================= 3. 全局辅助函数 =================
-def clean_str(s: str) -> str:
-    """终极清洗：剔除所有非字母数字字符，用于极速精准匹配"""
-    return re.sub(r'\W+', '', s).lower()
-
-
 async def resolve_query_to_id(query: str):
     if query.isdigit():
         return query
@@ -59,16 +53,31 @@ async def resolve_query_to_id(query: str):
     return None
 
 
-# ================= 4. 核心 Bot 类 (引入持久化索引) =================
+def get_id_from_cbz(filepath: str) -> str:
+    """⚡ 神级提取：不解压直接从 CBZ 内部的 ComicInfo.xml 提取 6位数 ID"""
+    try:
+        with zipfile.ZipFile(filepath, 'r') as z:
+            for item in z.infolist():
+                if item.filename.lower() == 'comicinfo.xml':
+                    xml_str = z.read(item).decode('utf-8', errors='ignore')
+                    # 正则匹配 <Web> 标签里的链接，提取 6位数 ID
+                    match = re.search(r'<Web>.*?nhentai\.net/g/(\d+)/?</Web>', xml_str, re.IGNORECASE)
+                    if match:
+                        return match.group(1)
+    except Exception as e:
+        print(f"[Warning] 无法从 {os.path.basename(filepath)} 读取 ID: {e}")
+    return None
+
+
+# ================= 4. 核心 Bot 类 (精准 ID 索引) =================
 class NhentaiBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=discord.Intents.default())
         self.session = None
-        # 内存索引字典 { "清洗后的名字": "实际文件名.cbz" }
+        # 内存索引字典 { "6位数ID": "实际文件名.cbz" }
         self.local_index = {}
 
     def load_index_from_disk(self):
-        """从 JSON 文件加载索引到内存"""
         if os.path.exists(INDEX_FILE):
             try:
                 with open(INDEX_FILE, 'r', encoding='utf-8') as f:
@@ -76,16 +85,15 @@ class NhentaiBot(commands.Bot):
                 print(f"[Index] 💾 已从 JSON 恢复索引，库藏 {len(self.local_index)} 本。")
                 return True
             except Exception as e:
-                print(f"[Index] ⚠️ JSON 索引损坏: {e}，将重新扫描...")
+                print(f"[Index] ⚠️ JSON 损坏，将重新扫描: {e}")
         return False
 
     def save_index_to_disk(self):
-        """将内存索引持久化保存到 JSON 文件"""
         try:
             with open(INDEX_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.local_index, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"[Index] ❌ 保存 JSON 索引失败: {e}")
+            print(f"[Index] ❌ 保存 JSON 失败: {e}")
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
@@ -94,27 +102,28 @@ class NhentaiBot(commands.Bot):
         if not os.path.exists(SAVE_DIRECTORY):
             os.makedirs(SAVE_DIRECTORY, exist_ok=True)
 
-        # 启动时：如果读不到 JSON 文件，强制先做一次全盘扫描
         if not self.load_index_from_disk():
             await self.sync_index_task()
 
-        # 启动后台自动巡逻任务
         self.sync_index_task.start()
         print("✅ Docker Bot 启动成功！斜杠指令已同步。")
 
     @tasks.loop(minutes=30)
     async def sync_index_task(self):
-        """每 30 分钟后台静默扫描，修复用户手动塞入/删除的本子差异"""
+        """每 30 分钟后台静默提取硬盘上所有 CBZ 的 6位数 ID"""
         temp_index = {}
         for filename in os.listdir(SAVE_DIRECTORY):
             if filename.lower().endswith('.cbz'):
-                temp_index[clean_str(filename)] = filename
+                filepath = os.path.join(SAVE_DIRECTORY, filename)
+                # 放在后台线程去拆包提取 XML，防卡顿
+                gal_id = await asyncio.to_thread(get_id_from_cbz, filepath)
+                if gal_id:
+                    temp_index[gal_id] = filename
 
-        # 如果发现硬盘里的文件和内存里记录的不一样了，更新内存并重写 JSON
         if temp_index != self.local_index:
             self.local_index = temp_index
             await asyncio.to_thread(self.save_index_to_disk)
-            print(f"[Index] 🔄 硬盘与索引已自动同步！最新库藏: {len(self.local_index)} 本。")
+            print(f"[Index] 🔄 硬盘 XML 索引已同步！最新库藏: {len(self.local_index)} 本。")
 
     @sync_index_task.before_loop
     async def before_sync(self):
@@ -254,6 +263,11 @@ async def cache_gallery(interaction: discord.Interaction, query: str):
     if not target_id:
         return await interaction.followup.send("❌ 找不到对应的本子。")
 
+    # ✨ XML ID 瞬间查重拦截！连 API 都不要调用了！
+    if target_id in bot.local_index:
+        return await interaction.followup.send(
+            f"✅ 该本子已经在库中，无需重复下载！\n📂 已存文件：`{bot.local_index[target_id]}`")
+
     download_url = f"{API_BASE}/galleries/{target_id}/download"
 
     try:
@@ -276,12 +290,6 @@ async def cache_gallery(interaction: discord.Interaction, query: str):
             if PREFIX_PATTERN.search(final_filename):
                 final_filename = PREFIX_PATTERN.sub("", final_filename)
 
-            # ✨ JSON 持久化索引：瞬间查重
-            target_clean = clean_str(final_filename)
-            if target_clean in bot.local_index:
-                return await interaction.followup.send(
-                    f"✅ 该本子已经在库中，无需重复下载！\n📂 已存文件：`{bot.local_index[target_clean]}`")
-
             final_filepath = os.path.join(SAVE_DIRECTORY, final_filename)
             with open(final_filepath, 'wb') as f:
                 async for chunk in resp.content.iter_chunked(1024 * 1024):
@@ -290,10 +298,10 @@ async def cache_gallery(interaction: discord.Interaction, query: str):
         final_filepath_after_process = await asyncio.to_thread(process_downloaded_cbz, final_filepath)
         result_filename = os.path.basename(final_filepath_after_process)
 
-        # ✨ 下载完成后：实时存入内存并写入 JSON 硬盘文件
-        bot.local_index[clean_str(result_filename)] = result_filename
+        # ✨ 下载完成后：使用 6位数ID 直接存入索引
+        bot.local_index[target_id] = result_filename
         await asyncio.to_thread(bot.save_index_to_disk)
-        print(f"[Index] ➕ 成功写入硬盘 JSON 索引: {result_filename}")
+        print(f"[Index] ➕ 成功存入 XML ID 索引: {target_id} -> {result_filename}")
 
         await interaction.followup.send(
             f"✅ 下载并修复成功！\n📂 存档: `{result_filename}`\n👉 可以去 Kavita 里面强制扫描了。")
@@ -302,7 +310,7 @@ async def cache_gallery(interaction: discord.Interaction, query: str):
         await interaction.followup.send(f"❌ 发生错误: {str(e)}")
 
 
-@bot.tree.command(name="read", description="在 Discord 阅读本子 (基于 JSON 索引极速秒开)")
+@bot.tree.command(name="read", description="在 Discord 阅读本子 (基于 XML ID 极速秒开)")
 @app_commands.describe(query="6位数ID或搜索词", public="公开显示(带马赛克) 还是 仅自己可见(无码)")
 async def read_gallery(interaction: discord.Interaction, query: str, public: bool = False):
     await interaction.response.defer(ephemeral=not public)
@@ -311,42 +319,14 @@ async def read_gallery(interaction: discord.Interaction, query: str, public: boo
     if not target_id:
         return await interaction.followup.send("❌ 找不到本子。")
 
-    async with bot.session.get(f"{API_BASE}/galleries/{target_id}", headers=HEADERS) as gal_resp:
-        if gal_resp.status != 200:
-            return await interaction.followup.send(f"❌ 无法获取本子详情，状态码: {gal_resp.status}")
-        gal_data = await gal_resp.json()
-        pages = gal_data.get("pages", gal_data.get("images", {}).get("pages", []))
-
-    if not pages:
-        return await interaction.followup.send("❌ 无法解析本子的页面数据。")
-
+    # ✨ 核心：通过 6 位数 ID 直接查找本地！
     local_filepath = None
-    download_url = f"{API_BASE}/galleries/{target_id}/download"
-    try:
-        async with bot.session.post(download_url, headers=HEADERS) as resp:
-            if resp.status == 200:
-                cd_header = resp.headers.get('Content-Disposition')
-                if cd_header:
-                    msg = email.message.EmailMessage()
-                    msg['content-disposition'] = cd_header
-                    original_filename = msg.get_filename() or ""
-                    if original_filename.endswith(".zip"):
-                        original_filename = original_filename[:-4] + ".cbz"
-                    final_filename = original_filename
-                    if PREFIX_PATTERN.search(final_filename):
-                        final_filename = PREFIX_PATTERN.sub("", final_filename)
-
-                    # ✨ 从持久化内存中极速查询
-                    target_clean = clean_str(final_filename)
-                    if target_clean in bot.local_index:
-                        local_filename = bot.local_index[target_clean]
-                        potential_path = os.path.join(SAVE_DIRECTORY, local_filename)
-                        # 为了极度安全，再摸一下实体文件在不在
-                        if os.path.exists(potential_path):
-                            local_filepath = potential_path
-                            print(f"[Debug] ⚡ 持久化 JSON 索引秒匹配成功！")
-    except:
-        pass
+    if target_id in bot.local_index:
+        local_filename = bot.local_index[target_id]
+        potential_path = os.path.join(SAVE_DIRECTORY, local_filename)
+        if os.path.exists(potential_path):
+            local_filepath = potential_path
+            print(f"[Debug] ⚡ XML ID [{target_id}] 匹配成功！加载本地文件...")
 
     if local_filepath:
         def get_cbz_pages():
@@ -368,6 +348,16 @@ async def read_gallery(interaction: discord.Interaction, query: str, public: boo
             view=view
         )
     else:
+        # 走网络模式
+        async with bot.session.get(f"{API_BASE}/galleries/{target_id}", headers=HEADERS) as gal_resp:
+            if gal_resp.status != 200:
+                return await interaction.followup.send(f"❌ 无法获取本子详情，状态码: {gal_resp.status}")
+            gal_data = await gal_resp.json()
+            pages = gal_data.get("pages", gal_data.get("images", {}).get("pages", []))
+
+        if not pages:
+            return await interaction.followup.send("❌ 无法解析本子的页面数据。")
+
         async with bot.session.get(f"{API_BASE}/cdn", headers=HEADERS) as cdn_resp:
             cdn_url = (await cdn_resp.json()).get("url",
                                                   "https://i.nhentai.net") if cdn_resp.status == 200 else "https://i.nhentai.net"
